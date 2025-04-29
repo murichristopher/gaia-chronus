@@ -1,0 +1,205 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# GAIA‑Chronus – Product Requirements Document (PRD)
+
+**Revisão**: v0.1
+**Data**: 29/04/2025
+**Autor**: ChatGPT (assistente)
+**Aprovadores**: _[preencher]_
+
+---
+
+## 1. Visão Geral
+GAIA‑Chronus é o backend de mensageria do ecossistema **GAIA**. Seu papel é:
+
+1. Gerenciar instâncias do WhatsApp via **Evolution API** (criação, autenticação via QR‑Code, status, remoção).
+2. Rotear eventos recebidos (webhooks) para o núcleo de IA do GAIA e despachar mensagens de resposta.
+3. Suportar **multitenancy** em _single database_ usando o discriminador `company_id` e **Row‑Level Security** (RLS) no Supabase.
+4. Expor métricas e logs operacionais para observabilidade.
+
+Quando combinado ao front‑end/LLM do GAIA, Chronus possibilita atendimento multicanal 24/7, escalável e seguro.
+
+---
+
+## 2. Problema & Oportunidade
+*Empresas que adotam GAIA precisam integrar WhatsApp sem lidar com toda a complexidade de conexão, filas e limitações da Evolution API.*
+
+Sem um serviço dedicado, cada empresa teria de:
+- Gerenciar chaves e QR‑Codes manualmente.
+- Armazenar estados de sessão em seus próprios servidores.
+- Monitorar reconexões, timeouts e quotas.
+
+Chronus centraliza essa camada, padroniza segurança e reduz _time‑to‑market_.
+
+---
+
+## 3. Objetivos (KPIs)
+| Métrica | Target MVP |
+|---------|------------|
+| Latência *send* GAIA→WhatsApp | ≤ 1 s P95 |
+| Disponibilidade API | 99.5 % mensal |
+| Suporte a tenants simultâneos | ≥ 1 000 |
+| Tempo médio de criação de instância | < 5 s |
+| Mensagens perdidas | 0 (com DLQ < 15 min) |
+
+---
+
+## 4. Stakeholders
+| Papel | Interesse |
+|-------|-----------|
+| **Operador de Suporte** | Criar/monitorar instâncias, visualizar status |
+| **Engenheiro de Plataforma GAIA** | Integrar GAIA Core ↔ Chronus, analisar métricas |
+| **Cliente final (usuário WhatsApp)** | Receber respostas rápidas e corretas |
+| **Equipe DevOps** | Manter uptime, escalar serviço |
+
+---
+
+## 5. Personas & Cenários‑chave (User Stories)
+1. **Tenant Admin cria instância**
+   *Como* admin de uma empresa, *quero* gerar um QR‑Code, *para* conectar o número de suporte ao GAIA.
+2. **GAIA envia resposta**
+   *Como* operador, *quero* que o GAIA responda automaticamente um cliente no WhatsApp, *para* reduzir meu volume de tickets.
+3. **Reautenticação automática**
+   *Como* Chronus, *quero* detectar desconexão e alertar o GAIA, *para* evitar falhas de atendimento.
+
+---
+
+## 6. Escopo
+### 6.1 MVP (Phase 1)
+- CRUD de instâncias (Evolution API)
+- Envio de mensagens de texto até 4096 chars
+- Recepção de webhooks e _forward_ para GAIA
+- Banco Supabase com RLS+`company_id`
+- Autenticação via **JWT Supabase** (RS256)
+- Observabilidade: pino‑http + Sentry + basic Prometheus exporter
+- DLQ em tabela `failed_dispatches` + job de _retry_.
+
+### 6.2 Fora de escopo MVP
+- Templates de mídia (imagem, áudio, docs)
+- Chatbots multinlíngues
+- Fila externa (Kafka/Rabbit)
+- Painel UI nativo (será via GAIA‑admin)
+
+---
+
+## 7. Requisitos Funcionais
+| ID | Descrição |
+|----|-----------|
+| **FR‑01** | O sistema **deve** permitir criar instância através do endpoint `POST /instances`.
+| **FR‑02** | O sistema **deve** armazenar `instance_name`, `api_key` e `company_id` em `wa_instances`.
+| **FR‑03** | O sistema **deve** validar JWT e garantir que o `company_id` da rota corresponde ao claim.
+| **FR‑04** | O sistema **deve** receber webhooks (`/events`) da Evolution API e persistir eventos brutos.
+| **FR‑05** | O sistema **deve** encaminhar mensagem recebida para GAIA via `POST /webhooks/incoming` com HMAC.
+| **FR‑06** | O sistema **deve** permitir enviar mensagem via `POST /messages/send` garantindo quota Evolution.
+| **FR‑07** | O sistema **deve** expor endpoint de health check (`/healthz`).
+| **FR‑08** | O sistema **deve** re‑enqueue no DLQ se Evolution API falhar (>3 tentativas).
+
+---
+
+## 8. Requisitos Não‑Funcionais
+- **N‑01 Segurança**: TLS 1.3 obrigatório; JWT RS256; HMAC nos webhooks.
+- **N‑02 Escalabilidade**: Suportar 30 msg/s por instância.
+- **N‑03 Disponibilidade**: 0 downtime planejado, blue‑green deploy.
+- **N‑04 Observabilidade**: Logs estruturados JSON, métricas Prometheus.
+- **N‑05 Conformidade**: LGPD (dados pessoais minimizados).
+
+---
+
+## 9. Arquitetura de Alto Nível
+```
+GAIA Core ──▶ Chronus (NestJS) ──▶ Evolution API
+    ▲              │
+    │              ├─ Supabase (Postgres + RLS)
+    ▼              └─ Prometheus / Sentry
+```
+- **NestJS** com módulos: `auth`, `instances`, `messages`, `webhooks`, `metrics`.
+- **Supabase**: single schema; RLS habilitado; políticas por `company_id`.
+
+---
+
+## 10. Modelo de Dados Essencial
+```sql
+-- companies já criada pelo GAIA
+create table wa_instances (
+  id            uuid primary key default gen_random_uuid(),
+  company_id    uuid not null references companies(id) on delete cascade,
+  instance_name text not null,
+  api_key       text not null,
+  status        text default 'PENDING',
+  phone         text,
+  created_at    timestamptz default now()
+);
+
+alter table wa_instances enable row level security;
+create policy "tenant_rls_instances"
+  on wa_instances using (company_id = (auth.jwt() ->> 'company_id')::uuid)
+  with check (company_id = (auth.jwt() ->> 'company_id')::uuid);
+```
+
+---
+
+## 11. Contratos de API (externos)
+
+| Método | Rota | Descrição |
+|--------|------|-----------|
+| POST | `/instances` | Cria instância e devolve QR‑Code Base64 |
+| GET  | `/instances/:id/status` | Retorna `CONNECTED|PENDING|FAILED` |
+| POST | `/messages/send` | `{ companyId, chatId, text }` |
+| POST | `/events` | Endpoint público para Evolution API webhooks |
+| POST | `/healthz` | 200 → alive |
+
+Todos os endpoints **exigem** `Authorization: Bearer <JWT>` (exceto `/events`, que usa HMAC).
+
+---
+
+## 12. Dependências
+- Evolution API 5.x
+- Supabase (autenticação + Postgres 15)
+- GAIA Core ≥ v0.5 (endpoints de webhook prontos)
+- Vercel (Deploy)
+
+---
+
+## 13. Riscos & Mitigações
+| Risco | Impacto | Mitigação |
+|-------|---------|-----------|
+| Limites Evolution API | Alto | Implementar fila e _retry_ exponencial |
+| Token JWT expirado | Médio | Renovação automática via Supabase Admin |
+| RLS mal configurado | Alto | Suite de testes de isolamento no CI |
+
+---
+
+## 14. Roadmap & Marcos
+| Fase | Data alvo | Entregável |
+|------|-----------|-----------|
+| Design & Setup | 10/05/2025 | Repositório + CI/CD + esquema DB |
+| MVP Dev | 30/05/2025 | Instância CRUD + envio/recepção texto |
+| Beta | 15/06/2025 | Multitenancy completo + observabilidade |
+| GA | 01/07/2025 | Suporte cliente piloto + SLO 99,5 % |
+
+---
+
+## 15. Critérios de Aceitação (MVP)
+- Criar instância retorna QR‑Code funcional (validado por scan).
+- Mensagem recebida pelo Evolution chega ao GAIA core ≤ 2 s.
+- RLS impede usuário de Tenant A acessar dados de Tenant B (testes de integração).
+- Downtime < 15 min em 30 dias.
+
+---
+
+## 16. Glossário
+| Termo | Definição |
+|-------|-----------|
+| **Evolution API** | API third‑party que expõe websocket/REST para WhatsApp |
+| **Tenant** | Empresa (registro em `companies`) |
+| **RLS** | Row‑Level Security do Postgres |
+| **DLQ** | Dead‑Letter Queue – tabela de falhas para reprocesso |
+| **HMAC** | Hash‑based Message Authentication Code, garante integridade do webhook |
+
+---
+
+_Última atualização automática: 29/04/2025_
+

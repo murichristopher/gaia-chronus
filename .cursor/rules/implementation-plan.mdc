@@ -1,0 +1,208 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Implementation Plan – GAIA‑Chronus (EC2 Deployment)
+
+> **Escopo**  Passo‑a‑passo para construir e publicar o **GAIA‑Chronus** em AWS EC2, integrando **Evolution API** e **Supabase**, com suporte a **múltiplas instâncias de WhatsApp** gerenciadas pelo próprio serviço.
+> **Versão**  v1.2 — 29/04/2025
+
+---
+
+## 0. Roadmap Resumido
+
+| Fase                    | Data‑alvo | Entregável‑chave                   |
+| ----------------------- | --------- | ---------------------------------- |
+| 0. Kick‑off             | 03/05     | Repo + CI/CD inicial               |
+| 1. Schema & RLS         | 10/05     | Migrations Supabase                |
+| 2. Auth & Tenant Guard  | 15/05     | JwtStrategy + TenantInterceptor    |
+| 3. Evol API (Multi‑instância) | 22/05 | CRUD + Gerenciador de processos    |
+| 4. Webhooks             | 29/05     | Inbound + forward GAIA             |
+| 5. Mensageria & Fila    | 05/06     | BullMQ + retries                   |
+| 6. Observabilidade      | 10/06     | CloudWatch Logs + Prometheus       |
+| 7. Testes & QA          | 15/06     | Cobertura ≥ 80 %                   |
+| 8. Deploy Staging (EC2) | 18/06     | AMI + Terraform + Smoke tests      |
+| 9. Go‑Live Prod         | 01/07     | Auto‑scaling group + SLO 99,5 %     |
+
+---
+
+## 1. Tarefas Detalhadas
+
+### Fase 0 – Kick‑off
+1. Criar monorepo `gaia‑chronus` (pnpm).
+2. Configurar **GitHub Actions**: `lint`, `test`, `docker‑build`.
+3. Escrever Dockerfile (`node:20‑alpine`, non‑root).
+4. Publicar imagem em **ECR** ou **GHCR**.
+
+### Fase 1 – Schema & RLS
+1. **Prisma schema** com `companies`, `wa_instances`, `webhook_events`, `outgoing_messages`, `failed_dispatches`.
+2. `prisma migrate dev` → Supabase.
+3. Políticas **RLS** por `company_id`.
+4. Seed tenant exemplo.
+
+### Fase 2 – Autenticação
+1. **JwtStrategy** (JWKS Supabase).
+2. `TenantGuard` + `TenantInterceptor` (`set_config`).
+3. Tests Vitest tokens válidos/expirados.
+
+### **Fase 3 – Integração Evolution API (Multi‑instância)**
+
+> **Objetivo**: Gerenciar _N_ instâncias de WhatsApp em paralelo, cada uma em processo isolado, mantendo estado em banco e fila em Redis.
+
+#### 3.1 – Tabela de Controle
+```sql
+CREATE TABLE wa_instances (
+  id           UUID PRIMARY KEY,
+  phone        VARCHAR(15) UNIQUE,
+  status       TEXT       NOT NULL,   -- starting | running | stopped | error | waiting_qr
+  session_path TEXT       NOT NULL,
+  pid          INTEGER,
+  last_ping    TIMESTAMP,
+  created_at   TIMESTAMP DEFAULT now(),
+  company_id   UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE
+);
+```
+Políticas RLS aplicadas pela coluna `company_id`.
+
+#### 3.2 – **InstanceManager** (Nest Service)
+```ts
+@Injectable()
+export class InstanceManager {
+  private readonly procs = new Map<string, ChildProcess>();
+  constructor(private readonly repo: InstanceRepo) {}
+
+  async boot(id: string, phone: string) {
+    if (this.procs.has(id)) return;
+    const sessionPath = `/sessions/${id}`;
+    const cp = fork('evolution-runner', [sessionPath]);
+    this.procs.set(id, cp);
+
+    await this.repo.upsert({ id, phone, status: 'running', pid: cp.pid, sessionPath });
+
+    cp.on('exit', async () => {
+      this.procs.delete(id);
+      await this.repo.updateStatus(id, 'stopped');
+    });
+  }
+
+  stop(id: string) {
+    this.procs.get(id)?.kill();
+  }
+
+  list() {
+    return this.repo.findAll();
+  }
+}
+```
+
+#### 3.3 – Wrapper **`evolution-runner.js`**
+* Recebe `sessionPath`, inicializa Evolution API apontando‑o.
+* Redireciona logs para `stdout`.
+* Usa `process.on('message')` para comandos (send, logout, etc.).
+
+#### 3.4 – Heartbeat
+```ts
+@Cron('*/30 * * * * *')               // a cada 30 s
+async healthCheck() {
+  const running = await this.repo.findRunning();
+  for (const row of running) {
+    try {
+      process.kill(row.pid, 0);       // sinal 0 = ping
+      await this.repo.ping(row.id);
+    } catch {
+      await this.repo.updateStatus(row.id, 'error');
+      // opcional: auto‑restart
+    }
+  }
+}
+```
+
+#### 3.5 – Fila de Envio (Redis ➜ BullMQ)
+* Produzir: `XADD wa:queue * instanceId chatId body`.
+* Worker lê apenas mensagens da própria instância.
+
+#### 3.6 – API REST
+| Método | Rota | Ação |
+|--------|------|------|
+| POST   | `/instances` | Cria registro, chama `boot()` |
+| DELETE | `/instances/:id` | `stop()` + cleanup sessão |
+| POST   | `/instances/:id/messages` | Publica na fila Redis |
+
+#### 3.7 – Logs & Métricas
+* `stdout` de cada runner ➜ **CloudWatch Logs** (grupo `evol-runner-*`).
+* Expor `/healthz` local (porta aleatória) para Prometheus scrape.
+
+#### 3.8 – Escalonamento
+* **Até 20 números**: `fork()` local.
+* **> 20**: spin containers via **Docker Compose** ou **Kubernetes** (Deployment label `account=id`).
+
+#### 3.9 – Backup de Sessão
+* Sincronizar `/sessions` → S3 (Boto3 CLI).
+* Restaurar instância apontando para mesmo `sessionPath`.
+
+#### 3.10 – Automação de QR / Re‑login
+* Detectar evento `qr` → status `waiting_qr`; expor via WS para front.
+* Evento `logout` → status `error`, reinício opcional.
+
+### Fase 4 – Webhooks
+1. `POST /events` (HMAC).
+2. Persistir em `webhook_events`.
+3. Forward para GAIA core.
+4. Load test 200 req/s.
+
+### Fase 5 – Mensageria & Fila
+1. **Redis** (EC2 Docker) ou **Elasticache**.
+2. BullMQ queue `sendMessage` + retries (1→2→4 s, máx 5).
+3. DLQ `failed_dispatches`.
+
+### Fase 6 – Observabilidade
+1. **pino-http** ➜ CloudWatch Logs.
+2. `/metrics` ➜ Prometheus + Grafana (Docker).
+3. **Sentry** exceptions.
+4. Alertas: CPU > 70 %, DLQ > 10.
+
+### Fase 7 – Testes & QA
+1. Unit + e2e ≥ 80 %.
+2. k6: P95 < 1 s.
+3. Pentest RLS.
+
+### Fase 8 – Deploy Staging (EC2)
+1. **Terraform**: VPC, ALB, ASG.
+2. Build imagem Docker → ECR.
+3. User‑data instala Docker + `docker run`.
+4. Smoke‑tests (`/healthz`).
+
+### Fase 9 – Go‑Live
+1. AMI dourada; ASG 2‑3 instâncias.
+2. Backup Redis snapshot.
+3. Route‑53 + ACM TLS para `chronus.gaia.ai`.
+4. Changelog `chronus@1.0.0`.
+5. Monitor Grafana & UptimeRobot.
+6. Rollback: AMI anterior + imagem container.
+
+---
+
+## 2. Responsáveis‑chave
+| Área                        | Owner         |
+| --------------------------- | ------------- |
+| AWS Infra (EC2, ALB, Redis) | DevOps        |
+| Evolution API Runner        | Backend Eng   |
+| Prisma / Migrations / RLS   | DBA / Backend |
+| Observabilidade             | SRE           |
+| Credenciais Evolution API   | SecOps        |
+
+---
+
+## 3. DoD (Definição de Pronto)
+* **Deploy EC2** funcional (staging & prod).
+* **Gerenciamento multi‑instância**: criar, listar, parar, enviar mensagem.
+* Logs → CloudWatch, métricas → Grafana, erros → Sentry.
+* Cobertura tests ≥ 80 %.
+* RLS verificada.
+* SLA inicial: **99,5 % uptime**.
+
+---
+
+_Última atualização: 29/04/2025_
+

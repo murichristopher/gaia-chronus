@@ -1,0 +1,106 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Tech Stack – **GAIA‑Chronus** (Backend de Mensageria)
+
+> **Escopo**: Este documento descreve exclusivamente as tecnologias que compõem **GAIA‑Chronus**, o serviço NestJS responsável pela gestão de instâncias WhatsApp via Evolution API.
+>
+> **Versão**: v1.0  —  29/04/2025
+
+---
+
+## 1. Runtime & Linguagem
+
+| Item      | Especificação                       |
+| --------- | ----------------------------------- |
+| Linguagem | **TypeScript 5.x**                  |
+| Runtime   | **Node.js 20 LTS** (ESM habilitado) |
+
+---
+
+## 2. Frameworks & Bibliotecas
+
+| Categoria       | Tecnologia                                              | Versão     |
+| --------------- | ------------------------------------------------------- | ---------- |
+| API layer       | **NestJS**                                              | 10.x       |
+| ORM             | **Prisma**                                              | 5.x        |
+| Auth            | **@nestjs/passport** + **@nestjs/jwt**                  | 10.x       |
+| HTTP Client     | **Axios**                                               | 1.x        |
+| Background Jobs | **BullMQ** (Redis)                                      | Latest     |
+| Config          | **@nestjs/config**                                      | 3.x        |
+| Validation      | **class‑validator** / **class‑transformneser**          | 0.15 / 0.6 |
+| Observability   | **pino-http** (logs), **@sentry/node**, **prom-client** | Latest     |
+
+---
+
+## 3. Banco de Dados
+
+| Ambiente     | Motor                  | Versão | Observações                         |
+| ------------ | ---------------------- | ------ | ----------------------------------- |
+| Prod / Stage | **Supabase Postgres**  | 15     | RLS + `company_id` discriminador    |
+| Local Dev    | Docker **Postgres 15** | –      | `supabase start` / `docker compose` |
+
+*Extensões necessárias*: `pgcrypto` (UUID), `pg_trgm` (busca), `pgvector` (se futuro embeddings for necessário).
+
+---
+
+## 4. Infraestrutura & Deploy
+
+| Item                                                   | Provedor / Ferramenta                                    |
+| ------------------------------------------------------ | -------------------------------------------------------- |
+| Hosting                                                | **Fly.io** (VM-Scale‑to‑0) ou Supabase Functions\*       |
+| Container Registry                                     | **GitHub Container Registry (GHCR)**                     |
+| CI/CD                                                  | **GitHub Actions** — jobs: lint, test, build, deploy     |
+| Secrets                                                | **Fly Secrets** ou **Supabase project vars**             |
+| Observabilidade                                        | Logs pino → **Vector → Loki** (Grafana Cloud)            |
+|                     Erros → **Sentry**                 |                                                          |
+|                     Métricas → **Prometheus Exporter** |                                                          |
+| CDN (webhooks)\*                                       | **Vercel Edge** (fallback apenas para /events estáticos) |
+
+\* Em produção, preferir **Fly.io** para stateful Redis; Supabase Functions pode servir apenas webhooks inbound se preciso.
+
+---
+
+## 5. Integrações Externas
+
+| Serviço                   | Propósito                                       | SDK / Protocolo                     |
+| ------------------------- | ----------------------------------------------- | ----------------------------------- |
+| **Evolution API v5**      | Gerenciar instâncias WhatsApp, enviar mensagens | REST + WebSocket                    |
+| **Supabase Auth**         | JWT RS256 compartilhado                         | `@supabase/supabase-js` (via Admin) |
+| **Redis (Upstash / Fly)** | Filas BullMQ & caching                          | BullMQ driver                       |
+
+---
+
+## 6. Qualidade & Ferramentas Dev
+
+| Tipo       | Ferramenta                             | Config principal            |
+| ---------- | -------------------------------------- | --------------------------- |
+| Lint       | **ESLint** + `@typescript-eslint`      | Airbnb base, 4‑space indent |
+| Format     | **Prettier 3**                         | `printWidth = 100`          |
+| Tests      | **Vitest** (unit), **Supertest** (e2e) | Cobertura ≥ 80 %            |
+| Docs API   | **Swagger** via `@nestjs/swagger`      | Rota `/docs` em stage       |
+| Migrations | **Prisma Migrate**                     | `migrate deploy` em prod    |
+
+---
+
+## 7. Padrões Operacionais
+
+- **Blue‑Green Deploy** com `fly deploy --strategy bluegreen`.
+- **TLS 1.3** obrigatório (terminação Fly ou Cloudflare Tunnel).
+- **Logs estruturados** (JSON) com requestId e companyId.
+- **Row‑Level Security** sempre habilitada; tokens admin (`service_role`) restritos a jobs.
+
+---
+
+## 8. Roadmap Futuro (Tech)
+
+1. **gRPC** interno entre GAIA e Chronus (substituir REST) — pós‑MVP.
+2. **Kafka / Redpanda** para event‑stream de mensagens — escalar além de Redis.
+3. **OpenTelemetry** tracing full stack.
+
+---
+
+*Última atualização: 29/04/2025*
+

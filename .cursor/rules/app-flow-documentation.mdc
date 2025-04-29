@@ -1,0 +1,101 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# App Flow – GAIA / Chronus (Jornada do Usuário)
+
+> **Objetivo**: Descrever, passo a passo, como um operador/admin navega pelo ecossistema GAIA para criar empresas, conectar instâncias de WhatsApp via Chronus e operar o atendimento.
+
+---
+
+## Visão Geral da Navegação
+
+```
+Login → Dashboard → Empresas → (Empresa ▸ Detalhes) → Conectar WhatsApp → Atender Conversas
+                                         │                         │
+                                         │                         └→ Configurações da Instância
+                                         └→ Usuários da Empresa
+```
+
+Cada tela indica ações principais, atalhos para as subsequentes e estado persistente (breadcrumbs na sidebar).
+
+---
+
+## 1. Login
+| O que acontece? | Campo e‑mail, senha ou SSO Supabase. Validação imediata. |
+| Navegação | Usuário autenticado é redirecionado para **Dashboard**. |
+| Ação-chave | Persistir `access_token` (localStorage) para chamadas próximas e preencher claims (company_id, role). |
+
+---
+
+## 2. Dashboard
+| O que acontece? | Vistas rápidas: métricas de mensagens, instâncias ativas, alertas. |
+| Navegação | Sidebar lista “Empresas”, “Instâncias”, “Conversas”. Cards linkam diretamente às seções. |
+| Ação-chave | Botão “Criar Empresa” (CTA primário). |
+
+---
+
+## 3. Empresas (lista)
+| O que acontece? | Tabela paginada com nome, # instâncias, status, created_at. |
+| Navegação | Clique na linha → **Detalhes da Empresa**. Breadcrumb: `Empresas / {nome}`. |
+| Ação‑chave | Botão “Nova Empresa” abre modal. |
+
+### 3.1 Criar Empresa (modal)
+| O que acontece? | Inputs: Nome, Prompt base, Idioma (PT‑BR). Submit cria registro via GAIA API. |
+| Navegação | Fechar / Submit → redireciona para tela de detalhes recém‑criada. |
+| Ação‑chave | Gatilho `POST /companies` (GAIA). |
+
+---
+
+## 4. Detalhes da Empresa
+| O que acontece? | Tabs: **Geral**, **Instâncias WhatsApp**, **Usuários**. Meta info visível no header. |
+| Navegação | Tab **Instâncias** → lista de instâncias deste tenant. |
+| Ação‑chave | Botão “Conectar WhatsApp”. |
+
+### 4.1 Instâncias WhatsApp (tab)
+| O que acontece? | Cartões de instância com status badge (PENDING, CONNECTED). |
+| Navegação | Card → **Configurações da Instância**. |
+| Ação‑chave | “Conectar WhatsApp” chama `POST /instances` (Chronus) → retorna QR‑Code. Modal exibe QR e instruções. |
+
+### 4.2 Configurações da Instância
+| O que acontece? | Mostrar número, `instance_name`, quota, última sincronização. |
+| Navegação | Botão “Voltar” ao tab Instâncias. |
+| Ação‑chave | “Desconectar” = DELETE /instances/:id. |
+
+---
+
+## 5. Conversas (Inbox)
+| O que acontece? | Painel split: lista de chats filtrável (esquerda) + janela de mensagens (direita). Mensagens em tempo real via SSE/WebSocket. |
+| Navegação | Selecionar chat carrega histórico. Link no header ao **Detalhes da Empresa** dona do chat. |
+| Ação‑chave | Campo de resposta → `POST /messages/send` (Chronus). |
+
+---
+
+## 6. Estados e Erros
+- Toasts suspensos indicam sucesso/erro.
+- Conexão perdida a instância? Banner vermelho persistent na **Instâncias**.
+- Token expirado → redirect para Login.
+
+---
+
+## 7. Fluxos Alternativos
+1. **Instância desconectada**
+   * Chronus dispara webhook `DISCONNECTED` → GAIA backend marca status = FAILED.
+   * Dashboard mostra alerta. Usuário clica “Reconectar” → exibe novo QR.
+2. **Multi‑empresa** (usuário com permissão GLOBAL_ADMIN)
+   * Seleciona empresa na top‑bar (dropdown). Contexto `company_id` muda, RLS filtra dados.
+
+---
+
+## 8. Pontos de Ação Críticos (KPIs)
+| Tela | Ação | Métrica |
+|------|------|---------|
+| Instâncias | Scan QR | Taxa de conexão (< 2 min) |
+| Inbox | Primeira resposta | SLA resposta inicial |
+| Dashboard | “Criar Empresa” | Taxa de sucesso criação |
+
+---
+
+_Fim do documento_
+
