@@ -1,0 +1,81 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id                String            @id @default(uuid())
+  name              String
+  created_at        DateTime          @default(now())
+  updated_at        DateTime          @updatedAt
+  wa_instances      WAInstance[]
+  webhook_events    WebhookEvent[]
+  outgoing_messages OutgoingMessage[]
+  failed_dispatches FailedDispatch[]
+}
+
+model WAInstance {
+  id                String            @id @default(uuid())
+  company_id        String
+  company           Company           @relation(fields: [company_id], references: [id])
+  instance_name     String
+  instance_id       String            @unique
+  status            String            @default("active")
+  created_at        DateTime          @default(now())
+  updated_at        DateTime          @updatedAt
+  webhook_events    WebhookEvent[]
+  outgoing_messages OutgoingMessage[]
+  failed_dispatches FailedDispatch[]
+}
+
+model WebhookEvent {
+  id            String      @id @default(uuid())
+  company_id    String
+  company       Company     @relation(fields: [company_id], references: [id])
+  instance_id   String
+  wa_instance   WAInstance @relation(fields: [instance_id], references: [instance_id])
+  event_type    String
+  payload       Json
+  status        String      @default("pending")
+  created_at    DateTime    @default(now())
+  processed_at  DateTime?
+}
+
+model OutgoingMessage {
+  id            String      @id @default(uuid())
+  company_id    String
+  company       Company     @relation(fields: [company_id], references: [id])
+  instance_id   String
+  wa_instance   WAInstance @relation(fields: [instance_id], references: [instance_id])
+  recipient     String
+  message       String
+  status        String      @default("pending")
+  created_at    DateTime    @default(now())
+  sent_at       DateTime?
+  failed_dispatches FailedDispatch[]
+}
+
+model FailedDispatch {
+  id                String          @id @default(uuid())
+  company_id        String
+  company           Company         @relation(fields: [company_id], references: [id])
+  instance_id       String
+  wa_instance       WAInstance     @relation(fields: [instance_id], references: [instance_id])
+  message_id        String
+  outgoing_message  OutgoingMessage @relation(fields: [message_id], references: [id])
+  error_message     String
+  retry_count       Int             @default(0)
+  created_at        DateTime        @default(now())
+  last_retry_at     DateTime?
+}
